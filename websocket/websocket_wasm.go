@@ -38,7 +38,7 @@ func (x *Conn) Chain(w io.Writer) {
 	x.dst = w
 }
 
-func (x Conn) ChainGetText() io.Writer {
+func (x Conn) ChainGet() io.Writer {
 	return x.dst
 }
 
@@ -74,19 +74,19 @@ func (x *Conn) Listen() error {
 		done = true
 	}
 
-	x.Conn.HandleClose(func(c websocket.Code) {
+	x.Conn.OnClose(func(c websocket.Code) {
 		var err error
 		if c != websocket.CodeNormal {
 			err = errors.New("websocket closed: " + strconv.Itoa(int(c)))
 		}
 		errFunc(err)
 	})
-	x.Conn.HandleBinary(func(b []byte) {
+	x.Conn.OnBinary(func(b []byte) {
 		if err := x.dst.Write(b); err != nil {
 			errFunc(err)
 		}
 	})
-	x.Conn.HandleText(func(s string) {
+	x.Conn.OnText(func(s string) {
 		if err := x.dstText.Write([]byte(s)); err != nil {
 			errFunc(err)
 		}
