@@ -94,6 +94,12 @@ func (x *signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerF
 	})
 
 	gate := rpc.NewDualGate(json.Codec{}, lib.AsResponder(json.Codec{}), cw, nil)
+	// in wasm environment data is likely delivered by a JS callback, we must not block that
+	// the write call itself should never be returning an error anyway
+	cw.Chain(io.WriterFunc(func(b []byte) error {
+		go gate.Write(b)
+		return nil
+	}))
 	caller := rpc.MakeCaller(json.Codec{}, gate)
 	cli := rpc.MakeClient(caller)
 
