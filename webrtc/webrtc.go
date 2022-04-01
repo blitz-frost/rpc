@@ -41,9 +41,12 @@ func (x Channel) OnClose(fn func()) {
 	x.ch.OnClose(fn)
 }
 
+/*
+Not present in wasm version
 func (x Channel) OnError(fn func(error)) {
 	x.ch.OnError(fn)
 }
+*/
 
 func (x Channel) OnOpen(fn func()) {
 	x.ch.OnOpen(fn)
