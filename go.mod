@@ -4,7 +4,7 @@ go 1.18
 
 require (
 	github.com/blitz-frost/ice v0.1.2
-	github.com/blitz-frost/io v0.0.0
+	github.com/blitz-frost/io v0.1.0
 	github.com/blitz-frost/wasm v0.2.1
 	github.com/gorilla/websocket v1.5.0
 	github.com/pion/webrtc/v3 v3.1.27

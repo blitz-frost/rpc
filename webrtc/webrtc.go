@@ -9,16 +9,6 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-/*
-var api *webrtc.API
-
-func init() {
-	settings := webrtc.SettingEngine{}
-	settings.SetICECredentials("someufragwithmoe", "somepasspordwithexiactlyhhbytesf")
-	api = webrtc.NewAPI(webrtc.WithSettingEngine(settings))
-}
-*/
-
 type Channel struct {
 	ch *webrtc.DataChannel
 	w  io.Writer
