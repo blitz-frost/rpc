@@ -151,6 +151,39 @@ func (x Client) Bind(name string, fptr any) error {
 	return nil
 }
 
+// BindClass binds all the functions in a class pointer.
+// See Library.RegisterClass for an explanation on classes.
+func (x Client) BindClass(classPtr any) error {
+	v := reflect.ValueOf(classPtr)
+	if v.Kind() != reflect.Pointer {
+		return errors.New("not a pointer")
+	}
+
+	v = v.Elem()
+	t := v.Type()
+	if t.Kind() != reflect.Struct {
+		return errors.New("not a class pointer")
+	}
+
+	for i, n := 0, t.NumField(); i < n; i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			return errors.New("unexported field")
+		}
+
+		if field.Type.Kind() != reflect.Func {
+			return errors.New("non-function field")
+		}
+
+		fptr := v.Field(i).Addr().Interface()
+		if err := x.Bind(field.Name, fptr); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // A Codec provides matching Encoders and Decoders, on demand.
 // These can be used to sequantially encode or decode data.
 type Codec interface {
@@ -372,6 +405,45 @@ func (x Library) Register(name string, f any) error {
 	}
 
 	x.lib[name] = p
+	return nil
+}
+
+/* RegisterClass registers all the functions of a class, using their member names.
+
+A class is an informal struct type containing only exported function members. Example:
+
+	type SomeClass struct {
+		SomeFunc func()
+		OtherFunc func(int) error
+	}
+
+The primary purpose of classes is to define method set contracts in cross packages.
+The Interface type should be more convenient for global function contracts, but the two approaches are essentially interchangable.
+*/
+func (x Library) RegisterClass(class any) error {
+	v := reflect.ValueOf(class)
+	t := v.Type()
+
+	if t.Kind() != reflect.Struct {
+		return errors.New("not a class")
+	}
+
+	for i, n := 0, t.NumField(); i < n; i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			return errors.New("unexported field")
+		}
+
+		if field.Type.Kind() != reflect.Func {
+			return errors.New("non-function field")
+		}
+
+		fn := v.Field(i).Interface()
+		if err := x.Register(field.Name, fn); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
