@@ -56,17 +56,17 @@ func (x Channel) Write(b []byte) error {
 	return x.ch.Send(b)
 }
 
-type signaler struct {
+type Signaler struct {
 	fnCandidate func(string) error
 	fnSdp       func(webrtc.SessionDescription) error
 }
 
-func (x signaler) candidate(candidate *webrtc.ICECandidate) error {
+func (x Signaler) candidate(candidate *webrtc.ICECandidate) error {
 	arg := candidate.ToJSON().Candidate
 	return x.fnCandidate(arg)
 }
 
-func (x *signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerFunc func() error) {
+func (x *Signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerFunc func() error) {
 	pending := make([]*webrtc.ICECandidate, 0)
 	mux := sync.Mutex{}
 
@@ -124,7 +124,7 @@ func (x *signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerF
 }
 
 func SignalAnswer(conn *webrtc.PeerConnection, cw io.ChainWriter) error {
-	sig := signaler{}
+	sig := Signaler{}
 	answerFunc := func() error {
 		answer, err := conn.CreateAnswer(nil)
 		if err != nil {
@@ -140,19 +140,25 @@ func SignalAnswer(conn *webrtc.PeerConnection, cw io.ChainWriter) error {
 	return nil
 }
 
-func SignalOffer(conn *webrtc.PeerConnection, cw io.ChainWriter) error {
-	offer, err := conn.CreateOffer(nil)
-	if err != nil {
-		return err
-	}
-	if err = conn.SetLocalDescription(offer); err != nil {
-		return err
-	}
-
-	sig := signaler{}
+// SignalOffer starts the WebRTC signaling process for a peer connection, using the provided data carrier.
+// Returns a function that can be used for renegotiation.
+func SignalOffer(conn *webrtc.PeerConnection, cw io.ChainWriter) (func() error, error) {
+	sig := Signaler{}
 	answerFunc := func() error { return nil }
 
 	sig.setup(conn, cw, answerFunc)
 
-	return sig.fnSdp(offer)
+	fn := func() error {
+		offer, err := conn.CreateOffer(nil)
+		if err != nil {
+			return err
+		}
+		if err = conn.SetLocalDescription(offer); err != nil {
+			return err
+		}
+
+		return sig.fnSdp(offer)
+	}
+
+	return fn, fn()
 }
