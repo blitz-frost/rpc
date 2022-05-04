@@ -29,6 +29,12 @@ var (
 type Conn struct {
 	*websocket.Conn
 
+	// Used to read whole messages from the connection before forwarding them.
+	// Should not be changed during an active Listen loop.
+	// Text buffer is separate as text messages are likely to need smaller buffers.
+	Buffer     io.CascadeWriter
+	BufferText io.CascadeWriter
+
 	dst     io.Writer
 	dstText io.Writer
 
@@ -79,6 +85,9 @@ func (x Conn) ChainGetText() io.Writer {
 
 // Listen begins a read loop on the underlying websocket, forwarding binary and text messages to their respective chain targets.
 // Returns on error.
+//
+// If custom features are desired, such as memory pooling or message preprocessing, set the Buffer or BufferText members before calling Listen.
+// If left nil, simple growing buffers will be used.
 func (x *Conn) Listen() error {
 	// discard unchained message types
 	if x.dst == nil {
@@ -88,19 +97,48 @@ func (x *Conn) Listen() error {
 		x.dstText = io.VoidWriter{}
 	}
 
+	// assign default buffers if needed
+	if x.Buffer == nil {
+		x.Buffer = new(buffer)
+	}
+	if x.BufferText == nil {
+		x.BufferText = new(buffer)
+	}
+
+	var (
+		buf io.CascadeWriter
+		w   io.Writer
+		b   = make([]byte, 4096)
+	)
 	for {
-		msgType, b, err := x.ReadMessage()
+		msgType, r, err := x.NextReader()
 		if err != nil {
 			return err
 		}
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			err = x.dst.Write(b)
+			buf = x.Buffer
+			w = x.dst
 		case websocket.TextMessage:
-			err = x.dstText.Write(b)
+			buf = x.BufferText
+			w = x.dstText
 		}
-		if err != nil {
+
+		// buffer message
+		for {
+			n, err := r.Read(b)
+			if err != nil {
+				break
+			}
+
+			if err = buf.Write(b[:n]); err != nil {
+				return err
+			}
+		}
+
+		// forward
+		if err = buf.WriteTo(w); err != nil {
 			return err
 		}
 	}
