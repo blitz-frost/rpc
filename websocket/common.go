@@ -1,6 +1,9 @@
 package websocket
 
 import (
+	stdio "io"
+	"sync"
+
 	"github.com/blitz-frost/io"
 )
 
@@ -35,4 +38,21 @@ func (x chainWriter) ChainGet() io.Writer {
 
 func (x chainWriter) Write(b []byte) error {
 	return x.write(b)
+}
+
+// A writer is used to write fragmented data to a connection, instead of full byte slices.
+type writer struct {
+	w   stdio.WriteCloser
+	mux *sync.Mutex // owning websocket write guard
+}
+
+func (x writer) Close() error {
+	err := x.w.Close()
+	x.mux.Unlock()
+	return err
+}
+
+func (x writer) Write(b []byte) error {
+	_, err := x.w.Write(b)
+	return err
 }

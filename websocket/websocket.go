@@ -148,14 +148,40 @@ func (x *Conn) Listen() error {
 
 func (x *Conn) Write(b []byte) error {
 	x.mux.Lock()
-	defer x.mux.Unlock()
-	return x.WriteMessage(websocket.BinaryMessage, b)
+	err := x.WriteMessage(websocket.BinaryMessage, b)
+	x.mux.Unlock()
+	return err
 }
 
 func (x *Conn) WriteText(b []byte) error {
 	x.mux.Lock()
-	defer x.mux.Unlock()
-	return x.WriteMessage(websocket.TextMessage, b)
+	err := x.WriteMessage(websocket.TextMessage, b)
+	x.mux.Unlock()
+	return err
+}
+
+func (x *Conn) Writer() (io.WriteCloser, error) {
+	x.mux.Lock()
+	w, err := x.NextWriter(websocket.BinaryMessage)
+	if err != nil {
+		return nil, err
+	}
+	return writer{
+		w:   w,
+		mux: &x.mux,
+	}, nil
+}
+
+func (x *Conn) WriterText() (io.WriteCloser, error) {
+	x.mux.Lock()
+	w, err := x.NextWriter(websocket.TextMessage)
+	if err != nil {
+		return nil, err
+	}
+	return writer{
+		w:   w,
+		mux: &x.mux,
+	}, nil
 }
 
 // A Server wraps a http.ServeMux and http.Server.
