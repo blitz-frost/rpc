@@ -3,15 +3,15 @@ module github.com/blitz-frost/rpc
 go 1.18
 
 require (
+	github.com/blitz-frost/conv v0.3.0
 	github.com/blitz-frost/ice v0.1.2
-	github.com/blitz-frost/io v0.1.1
-	github.com/blitz-frost/wasm v0.2.2
+	github.com/blitz-frost/io v0.1.2
+	github.com/blitz-frost/wasm v0.2.3
 	github.com/gorilla/websocket v1.5.0
 	github.com/pion/webrtc/v3 v3.1.27
 )
 
 require (
-	github.com/blitz-frost/conv v0.2.0 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/pion/datachannel v1.5.2 // indirect
 	github.com/pion/dtls/v2 v2.1.3 // indirect
@@ -34,3 +34,7 @@ require (
 	golang.org/x/sys v0.0.0-20220328115105-d36c6a25d886 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 )
+
+replace github.com/blitz-frost/ice => /home/blitzfrost/go/src/github.com/blitz-frost/ice
+
+replace github.com/blitz-frost/io => /home/blitzfrost/go/src/github.com/blitz-frost/io

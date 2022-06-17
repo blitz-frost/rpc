@@ -1,0 +1,5 @@
+TODO
+- move encoding interfaces in own package
+- review base package
+- rework subpackages
+- test rework

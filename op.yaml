@@ -5,17 +5,23 @@ var:
 routes:
   clean:
     procs:
-    - path: go
+    - name: ice
+      path: go
       args: [mod, edit, "-dropreplace={{.repo}}/ice"]
-    - path: go
+    - name: io
+      path: go
       args: [mod, edit, "-dropreplace={{.repo}}/io"]
-    - path: go
+    - name: wasm
+      path: go
       args: [mod, edit, "-dropreplace={{.repo}}/wasm"]
   taint:
     procs:
-    - path: go
+    - name: ice
+      path: go
       args: [mod, edit, "-replace={{.repo}}/ice=${BLITZ}/ice"]
-    - path: go
+    - name: io
+      path: go
       args: [mod, edit, "-replace={{.repo}}/io=${BLITZ}/io"]
-    - path: go
+    - name: wasm
+      path: go
       args: [mod, edit, "-replace={{.repo}}/wasm=${BLITZ}/wasm"]

@@ -68,31 +68,22 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/blitz-frost/io"
+	"github.com/blitz-frost/conv"
+	"github.com/blitz-frost/io/msg"
 )
-
-// A bit of a shenanigan in order to always have the error interface type at hand.
-// Used to check if types implement error.
-var errorType reflect.Type = reflect.TypeOf(new(error)).Elem()
-
-// kinds that are not supported for inputs or outputs of RPC functions.
-var invalidKinds = map[reflect.Kind]struct{}{
-	reflect.Chan:      struct{}{},
-	reflect.Func:      struct{}{},
-	reflect.Interface: struct{}{},
-}
 
 // A Caller mediates procedure calls between a Client and a Library, without having to hold information about either end.
 type Caller interface {
-	// The first argument is a slice of pointers to expected result values, excluding the final error.
+	// The first argument is a unique name for the procedure being called, agreed on by both processes.
 	//
 	// The second argument is a slice of argument values to be transmited to the external procedure.
 	//
-	// The third argument is a unique name for the procedure being called, agreed on by both processes.
+	// The third argument is a slice of types of the expected return values, excluding the final error.
 	//
 	// The result slice does not include the call error, which should be returned separately instead.
 	// This is to allow usage of encodings that cannot directly handle interfaces, so the error can be treated internally as a string instead.
-	Call([]reflect.Value, []reflect.Value, string) error
+	// The slice must contain valid values of the appropriate type.
+	Call(string, []reflect.Value, []reflect.Type) ([]reflect.Value, error)
 }
 
 // Client represents an RPC Client.
@@ -125,26 +116,12 @@ func (x Client) Bind(name string, fptr any) error {
 	}
 
 	fn := func(args []reflect.Value) (results []reflect.Value) {
-		// prepare pointers to return data types, except the error
-		var err error
-		results = make([]reflect.Value, numOut+1)
-		for i := 0; i < numOut; i++ {
-			results[i] = reflect.New(outTypes[i])
+		o, err := x.c.Call(name, args, outTypes)
+		oErr := reflect.Zero(typeError)
+		if err != nil {
+			oErr = reflect.ValueOf(err)
 		}
-		// dereference result pointers before returning
-		defer func() {
-			for i := 0; i < numOut; i++ {
-				results[i] = results[i].Elem()
-			}
-			if err != nil {
-				results[numOut] = reflect.ValueOf(err)
-			} else {
-				results[numOut] = reflect.Zero(errorType)
-			}
-		}()
-
-		err = x.c.Call(results[:numOut], args, name)
-		return
+		return append(o, oErr)
 	}
 
 	fv.Set(reflect.MakeFunc(ft, fn))
@@ -187,149 +164,194 @@ func (x Client) BindClass(classPtr any) error {
 // A Codec provides matching Encoders and Decoders, on demand.
 // These can be used to sequantially encode or decode data.
 type Codec interface {
-	Decoder() Decoder
-	Encoder() Encoder
+	Decoder(msg.Reader) Decoder
+	Encoder(msg.Writer) Encoder
 }
 
-// Decode calls should be capable of decoding data in the reverse order that it was encoded by a compatible Encoder,
-// DecodeValues will always be called last, once.
+type CodecConn interface {
+	Encoder() (Encoder, error)
+	ChainDecode(DecoderFrom) error
+}
+
+type Conn interface {
+	msg.WriterSource
+	msg.ReadChainer
+}
+
 type Decoder interface {
-	Decode(any) error                   // decode value into arbitray pointer
-	DecodeValues([]reflect.Value) error // decode values into a slice of arbitrary pointers
-	Write([]byte) error                 // load data for sequential decoding
+	Reader() (msg.Reader, error) // expose raw byte reader, at current position; Decoder should no longer be used
+	Decode(reflect.Type) (reflect.Value, error)
+	Close() error
 }
 
-// A DualGate can handle both requests and responses on the same connection.
+type DecoderFrom interface {
+	DecodeFrom(Decoder) error
+}
+
+// A DualGate filters between RPC requests and responses.
 // If one side of the connection uses a DualGate, then both sides must do so.
 type DualGate struct {
-	codec  Codec
-	conn   io.Writer // outgoing message destination
-	dstNon io.Writer // incoming non rpc message destination
+	conn CodecConn
 
-	disp dispatch  // outgoing request identifier
-	res  Responder // incoming request responder
+	dstReq DecoderFrom
+	dstRes DecoderFrom
 }
 
-func NewDualGate(codec Codec, res Responder, conn io.ChainWriter, dstNon io.Writer) *DualGate {
-	if dstNon == nil {
-		dstNon = io.VoidWriter{}
-	}
+func NewDualGate(conn CodecConn) *DualGate {
 	x := &DualGate{
-		codec:  codec,
-		conn:   conn,
-		dstNon: dstNon,
-		disp:   *newDispatch(),
-		res:    res,
+		conn: conn,
 	}
-	conn.Chain(x)
+	conn.ChainDecode(x)
 	return x
 }
 
-func (x *DualGate) Request(enc Encoder) (Decoder, error) {
-	id, ch := x.disp.provision()
-	defer x.disp.release(id)
+// AsConnResp returns the DualGate as a CodecConn for use by ResponseGates.
+func (x *DualGate) AsConnResp() CodecConn {
+	return dualGate{x}
+}
 
-	// encode ID
-	if err := enc.Encode(id); err != nil {
-		return nil, err
+func (x *DualGate) ChainDecode(dstReq DecoderFrom) error {
+	x.dstReq = dstReq
+	return nil
+}
+
+func (x *DualGate) ChainDecodeResp(dstRes DecoderFrom) error {
+	x.dstRes = dstRes
+	return nil
+}
+
+func (x *DualGate) DecodeFrom(dec Decoder) error {
+	isReqVal, err := dec.Decode(typeBool)
+	if err != nil {
+		dec.Close()
+		return nil
 	}
 
-	// is an RPC request
-	if err := enc.Encode(true); err != nil {
-		return nil, err
+	if isReqVal.Bool() {
+		return x.dstReq.DecodeFrom(dec)
 	}
 
-	// is an RPC message
-	if err := enc.Encode(true); err != nil {
-		return nil, err
-	}
+	return x.dstRes.DecodeFrom(dec)
+}
 
-	// finalize encoding and send request
-	b, err := enc.Read()
+func (x *DualGate) Encoder() (Encoder, error) {
+	enc, err := x.conn.Encoder()
 	if err != nil {
 		return nil, err
 	}
-	if err = x.conn.Write(b); err != nil {
+
+	// is request
+	if err = enc.Encode(reflect.ValueOf(true)); err != nil {
+		enc.Cancel()
 		return nil, err
 	}
 
-	// wait for response
-	dec := <-ch
-	return dec, nil
+	return enc, nil
 }
 
-// Write accepts incoming messages.
-func (x *DualGate) Write(b []byte) error {
-	// don't return errors related to decoding a particular message
-
-	dec := x.codec.Decoder()
-	if err := dec.Write(b); err != nil {
-		return nil
-	}
-
-	var isRpc bool
-	if err := dec.Decode(&isRpc); err != nil {
-		return nil
-	}
-
-	if !isRpc {
-		var non []byte
-		if err := dec.Decode(&non); err != nil {
-			return nil
-		}
-		return x.dstNon.Write(non)
-	}
-
-	var isReq bool
-	if err := dec.Decode(&isReq); err != nil {
-		return nil
-	}
-
-	if !isReq {
-		// decode request ID
-		var id uint64
-		if err := dec.Decode(&id); err != nil {
-			return nil
-		}
-
-		x.disp.resolve(id, dec)
-		return nil
-	}
-
-	enc, err := respondId(x.res, dec)
+func (x *DualGate) EncoderResp() (Encoder, error) {
+	enc, err := x.conn.Encoder()
 	if err != nil {
-		if _, ok := err.(decodingError); ok {
-			err = nil
-		}
-		return err
+		return nil, err
 	}
 
-	// is a response, not a request
-	if err := enc.Encode(false); err != nil {
-		return err
+	// is not request
+	if err = enc.Encode(reflect.ValueOf(false)); err != nil {
+		enc.Cancel()
+		return nil, err
 	}
 
-	// is an RPC message
-	if err := enc.Encode(true); err != nil {
-		return err
-	}
-
-	if b, err = enc.Read(); err != nil {
-		return err
-	}
-	return x.conn.Write(b)
+	return enc, nil
 }
 
-// WriteNon writes a non-RPC message to the underlying connection.
-func (x DualGate) WriteNon(b []byte) error {
-	return writeNonTo(b, x.codec, x.conn)
-}
-
-// EncodeValues will always be called first, once.
 type Encoder interface {
-	Encode(any) error                   // encode arbitrary value
-	EncodeValues([]reflect.Value) error // encode slice of arbitrary values
-	Read() ([]byte, error)              // finalize, and return encoding
+	Writer() (msg.Writer, error) // expose raw byte writer; Encoder should finalize and it should not be used anymore
+	Encode(reflect.Value) error
+	Close() error
+	Cancel()
+}
+
+// A Gate filters RPC from non-RPC messages.
+// To be used when the underlying connection is not used exclusively for RPC data transfer.
+// If one side uses a Gate, them both sides must do so.
+//
+// Users should use the Gate.Writer method to write to the underlying connection.
+type Gate struct {
+	conn CodecConn
+
+	dstRpc DecoderFrom
+	dstNon msg.ReaderFrom
+}
+
+// Wraps conn as a Gate. Both RPC and non-RPC destinations must be set before usage.
+func NewGate(conn CodecConn) *Gate {
+	x := &Gate{
+		conn: conn,
+	}
+	conn.ChainDecode(x)
+	return x
+}
+
+// set RPC message destination
+func (x *Gate) ChainDecode(dst DecoderFrom) error {
+	x.dstRpc = dst
+	return nil
+}
+
+// set non-RPC message destination
+func (x *Gate) ChainRead(dst msg.ReaderFrom) error {
+	x.dstNon = dst
+	return nil
+}
+
+func (x *Gate) DecodeFrom(dec Decoder) error {
+	// is RPC?
+	isRpcVal, err := dec.Decode(typeBool)
+	if err != nil {
+		// silently drop unexpected messages
+		dec.Close()
+		return nil
+	}
+
+	if isRpcVal.Bool() {
+		return x.dstRpc.DecodeFrom(dec)
+	}
+
+	r, err := dec.Reader()
+	if err != nil {
+		dec.Close()
+		return err
+	}
+	return x.dstNon.ReadFrom(r)
+}
+
+func (x *Gate) Encoder() (Encoder, error) {
+	enc, err := x.conn.Encoder()
+	if err != nil {
+		return nil, err
+	}
+
+	// is an RPC message
+	if err = enc.Encode(reflect.ValueOf(true)); err != nil {
+		return nil, err
+	}
+
+	return enc, err
+}
+
+// Writer returns a writer for non-RPC data. To be used instead of requesting one from the underling connection directly.
+func (x *Gate) Writer() (msg.Writer, error) {
+	enc, err := x.conn.Encoder()
+	if err != nil {
+		return nil, err
+	}
+
+	// is not an RPC message
+	if err = enc.Encode(reflect.ValueOf(false)); err != nil {
+		return nil, err
+	}
+
+	return enc.Writer()
 }
 
 // An Interface helps maintain consistency between Go programs.
@@ -379,13 +401,6 @@ type Library struct {
 func MakeLibrary() Library {
 	return Library{
 		lib: make(map[string]Procedure),
-	}
-}
-
-func (x Library) AsResponder(c Codec) Responder {
-	return libraryResponder{
-		c: c,
-		l: x,
 	}
 }
 
@@ -479,17 +494,12 @@ func makeProcedure(f any) (Procedure, error) {
 	return x, nil
 }
 
-// args returns a set of pointers to the procedure's input types.
-// These pointers must be dereferenced before using them in the "Call" method.
-func (x Procedure) Args() []reflect.Value {
-	o := make([]reflect.Value, len(x.inType))
-	for i := 0; i < len(o); i++ {
-		o[i] = reflect.New(x.inType[i])
-	}
-	return o
+// Args returns the procedure's input types.
+func (x Procedure) Args() []reflect.Type {
+	return x.inType
 }
 
-// call executes the underlying function with the provided input.
+// Call executes the underlying function with the provided input.
 // Returns the final error separately from the other return values.
 func (x Procedure) Call(in []reflect.Value) ([]reflect.Value, error) {
 	r := x.f.Call(in)
@@ -501,221 +511,279 @@ func (x Procedure) Call(in []reflect.Value) ([]reflect.Value, error) {
 	return r[:n], nil
 }
 
-type Requester interface {
-	Request(Encoder) (Decoder, error)
+type Request interface {
+	Encode(reflect.Value) error
+	Do() (Decoder, error)
+	Cancel()
 }
 
-// A RequestGate wraps a basic connection that cannot automatically return the response to a specific request message by itself.
-// Is concurrent safe if the connection is.
-// Raw incoming messages, for example from a read loop, must be delivered to the RequestGate using its Write method.
 type RequestGate struct {
-	codec  Codec
-	conn   io.Writer // outgoing message destination
-	dstNon io.Writer // incoming non rpc message destination
+	conn CodecConn
 
 	disp dispatch // request identification
 }
 
-// NewRequestGate returns a usable RequestGate.
-// Writes raw rpc messages to conn.
-// Will write incoming non-RPC messages to dstNon, which may be nil.
-func NewRequestGate(codec Codec, conn io.ChainWriter, dstNon io.Writer) *RequestGate {
-	if dstNon == nil {
-		dstNon = io.VoidWriter{}
-	}
+func NewRequestGate(conn CodecConn) *RequestGate {
 	x := &RequestGate{
-		codec:  codec,
-		conn:   conn,
-		dstNon: dstNon,
-		disp:   *newDispatch(),
+		conn: conn,
+		disp: *newDispatch(),
 	}
-	conn.Chain(x)
+	conn.ChainDecode(x)
 	return x
 }
 
-func (x *RequestGate) Request(enc Encoder) (Decoder, error) {
-	// allocate call ID and associated response channel
-	id, ch := x.disp.provision()
-
-	// we let this method take responsibility for cleanup, as it might also be necessary on error
-	defer x.disp.release(id)
-
-	// encode ID
-	if err := enc.Encode(id); err != nil {
-		return nil, err
-	}
-
-	// is an RPC message
-	if err := enc.Encode(true); err != nil {
-		return nil, err
-	}
-
-	// finalize encoding and send request
-	b, err := enc.Read()
-	if err != nil {
-		return nil, err
-	}
-	if err := x.conn.Write(b); err != nil {
-		return nil, err
-	}
-
-	// wait for response
-	dec := <-ch
-	return dec, nil
-}
-
-// Write accepts incoming raw messages from a connection.
-func (x *RequestGate) Write(b []byte) error {
+// DecodeFrom accepts incoming encoded messages from a connection.
+func (x *RequestGate) DecodeFrom(dec Decoder) error {
 	// don't return errors related to decoding a particular message
 
-	dec := x.codec.Decoder()
-	if err := dec.Write(b); err != nil {
-		return nil
-	}
-
-	var isRpc bool
-	if err := dec.Decode(&isRpc); err != nil {
-		return nil
-	}
-
-	if !isRpc {
-		var non []byte
-		if err := dec.Decode(&non); err != nil {
-			return nil
-		}
-		return x.dstNon.Write(non)
-	}
-
 	// decode call ID
-	var id uint64
-	if err := dec.Decode(&id); err != nil {
+	idVal, err := dec.Decode(typeUint64)
+	if err != nil {
+		dec.Close()
 		return nil
 	}
 
-	x.disp.resolve(id, dec)
+	x.disp.resolve(idVal.Uint(), response{
+		dec: dec,
+		err: nil,
+	})
 	return nil
 }
 
-// WriteNon writes a non-RPC message to the underlying connection.
-// To be used instead of writing to it directly.
-func (x RequestGate) WriteNon(b []byte) error {
-	return writeNonTo(b, x.codec, x.conn)
+func (x *RequestGate) Request() (Request, error) {
+	// allocate call ID and associated response channel
+	// do this before potentially blocking the connection for encoding
+	id, ch := x.disp.provision()
+
+	enc, err := x.conn.Encoder()
+	if err != nil {
+		x.disp.release(id)
+		return nil, err
+	}
+
+	req := request{
+		id:     id,
+		cancel: x.disp.release,
+		enc:    enc,
+		ch:     ch,
+	}
+
+	// encode ID
+	if err := enc.Encode(reflect.ValueOf(id)); err != nil {
+		req.Cancel()
+		return nil, err
+	}
+
+	return req, nil
 }
 
-type Responder interface {
-	Respond(Decoder) (Encoder, error)
+type Requester interface {
+	Request() (Request, error)
 }
 
-// A ResponseGate is the counterpart to a RequestGate.
 type ResponseGate struct {
-	codec  Codec
-	res    Responder
-	conn   io.Writer // outgoing message destination
-	dstNon io.Writer // incoming non-RPC message destination
+	conn CodecConn
+	lib  Library
 }
 
-// MakeResponseGate returns a usable ResponseGate that writes incoming non-RPC messages to dstNon, which may be nil.
-// Sends raw RPC responses to conn.
-func MakeResponseGate(codec Codec, res Responder, conn io.ChainWriter, dstNon io.Writer) ResponseGate {
-	if dstNon == nil {
-		dstNon = io.VoidWriter{}
-	}
+func MakeResponseGate(conn CodecConn, lib Library) ResponseGate {
 	x := ResponseGate{
-		codec:  codec,
-		res:    res,
-		conn:   conn,
-		dstNon: dstNon,
+		conn: conn,
+		lib:  lib,
 	}
-	conn.Chain(x)
+	conn.ChainDecode(x)
 	return x
 }
 
-// Write accepts incoming raw messages from a connection.
-func (x ResponseGate) Write(b []byte) error {
-	// don't return errors related to decoding a particular message
-
-	dec := x.codec.Decoder()
-	if err := dec.Write(b); err != nil {
+func (x ResponseGate) DecodeFrom(dec Decoder) (err error) {
+	idVal, errDec := dec.Decode(typeUint64)
+	defer func() {
+		if errDec != nil {
+			dec.Close()
+		}
+	}()
+	if errDec != nil {
 		return nil
 	}
 
-	var isRpc bool
-	if err := dec.Decode(&isRpc); err != nil {
+	nameVal, errDec := dec.Decode(typeString)
+	if errDec != nil {
 		return nil
 	}
 
-	if !isRpc {
-		var non []byte
-		if err := dec.Decode(&non); err != nil {
+	var (
+		results []reflect.Value
+		errCall error
+	)
+	defer func() {
+		// send no response if input could not be decoded
+		if errDec != nil {
+			return
+		}
+
+		var enc Encoder
+		enc, err = x.conn.Encoder()
+		if err != nil {
+			return
+		}
+
+		defer func() {
+			if err != nil {
+				enc.Cancel()
+			} else {
+				enc.Close()
+			}
+		}()
+
+		if err = enc.Encode(idVal); err != nil {
+			return
+		}
+
+		var errStr string
+		if errCall != nil {
+			errStr = errCall.Error()
+		}
+
+		if err = enc.Encode(reflect.ValueOf(errStr)); err != nil {
+			return
+		}
+
+		// don't bother encoding the output if we have an error
+		if errCall != nil {
+			return
+		}
+
+		for _, v := range results {
+			if err = enc.Encode(v); err != nil {
+				return
+			}
+		}
+	}()
+
+	proc, errCall := x.lib.Get(nameVal.String())
+	if errCall != nil {
+		dec.Close()
+		return nil
+	}
+
+	argTypes := proc.Args()
+	argValues := make([]reflect.Value, len(argTypes))
+	for i, t := range argTypes {
+		if argValues[i], errDec = dec.Decode(t); err != nil {
 			return nil
 		}
-		return x.dstNon.Write(non)
 	}
+	dec.Close()
 
-	enc, err := respondId(x.res, dec)
-	if err != nil {
-		if _, ok := err.(decodingError); ok {
-			err = nil
-		}
-		return err
-	}
+	results, errCall = proc.Call(argValues)
 
-	if err := enc.Encode(true); err != nil {
-		return err
-	}
-	if b, err = enc.Read(); err != nil {
-		return err
-	}
-
-	return x.conn.Write(b)
+	return
 }
 
-// WriteNon writes a non-rpc message to the underlying connection.
-// To be used instead of writing directly.
-func (x ResponseGate) WriteNon(b []byte) error {
-	return writeNonTo(b, x.codec, x.conn)
-}
+var (
+	typeBool   = reflect.TypeOf(true)
+	typeError  = reflect.TypeOf(new(error)).Elem()
+	typeString = reflect.TypeOf("")
+	typeUint64 = reflect.TypeOf(uint64(0))
+)
 
 type caller struct {
-	c Codec
 	r Requester
 }
 
-// MakeCaller bundles a Codec and a Processor together to function as a Caller.
-func MakeCaller(c Codec, r Requester) Caller {
+// MakeCaller wraps a Requester to function as a Caller.
+func MakeCaller(r Requester) Caller {
 	return caller{
-		c: c,
 		r: r,
 	}
 }
 
-func (x caller) Call(res, args []reflect.Value, name string) error {
-	// encode call name + arguments
-	enc := x.c.Encoder()
-	if err := enc.EncodeValues(args); err != nil {
-		return err
+func (x caller) Call(name string, args []reflect.Value, outTypes []reflect.Type) (result []reflect.Value, err error) {
+	nOut := len(outTypes)
+	result = make([]reflect.Value, nOut, nOut+1) // provide capacity for error value appending
+	defer func() {
+		if err != nil {
+			for i := range result {
+				result[i] = reflect.Zero(outTypes[i])
+			}
+		}
+	}()
+
+	req, err := x.r.Request()
+	if err != nil {
+		return
 	}
-	if err := enc.Encode(name); err != nil {
-		return err
+
+	if err = req.Encode(reflect.ValueOf(name)); err != nil {
+		req.Cancel()
+		return
+	}
+	for i := range args {
+		if err = req.Encode(args[i]); err != nil {
+			req.Cancel()
+			return
+		}
 	}
 
 	// send call and get response
-	dec, err := x.r.Request(enc)
+	dec, err := req.Do()
 	if err != nil {
-		return err
+		return
 	}
+	defer dec.Close()
 
 	// check error
-	var errStr string
-	if err := dec.Decode(&errStr); err != nil {
-		return err
+	errVal, err := dec.Decode(typeString)
+	if err != nil {
+		return
 	}
-	if errStr != "" {
-		return errors.New(errStr)
+	if errStr := errVal.String(); errStr != "" {
+		err = errors.New(errStr)
+		return
 	}
 
 	// decode results
-	return dec.DecodeValues(res)
+	for i := range result {
+		if result[i], err = dec.Decode(outTypes[i]); err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+type codecConn struct {
+	conn  Conn
+	codec Codec
+
+	dst DecoderFrom
+}
+
+func WrapConn(conn Conn, codec Codec) CodecConn {
+	x := &codecConn{
+		conn:  conn,
+		codec: codec,
+	}
+	conn.ChainRead(x)
+	return x
+}
+
+func (x *codecConn) ChainDecode(dst DecoderFrom) error {
+	x.dst = dst
+	return nil
+}
+
+func (x codecConn) Encoder() (Encoder, error) {
+	w, err := x.conn.Writer()
+	if err != nil {
+		return nil, err
+	}
+	return x.codec.Encoder(w), nil
+}
+
+func (x codecConn) ReadFrom(r msg.Reader) error {
+	dec := x.codec.Decoder(r)
+	return x.dst.DecodeFrom(dec)
 }
 
 // decodingError wraps decoding errors.
@@ -735,20 +803,20 @@ func (x decodingError) Unwrap() error {
 
 type dispatch struct {
 	next    uint64
-	pending map[uint64]chan Decoder
+	pending map[uint64]chan response
 	mux     sync.Mutex
 }
 
 func newDispatch() *dispatch {
 	return &dispatch{
-		pending: make(map[uint64]chan Decoder),
+		pending: make(map[uint64]chan response),
 	}
 }
 
 // provision returns a unique ID and a channel to receive an asynchronous response.
-// It is the caller's responsibility to release the provided ID.
-func (x *dispatch) provision() (uint64, chan Decoder) {
-	ch := make(chan Decoder, 1) // cap of 1 so the resolver doesn't block if the provisioning side goroutine exits prematurely
+// It is the caller's responsibility to resolve or release the provided ID.
+func (x *dispatch) provision() (uint64, chan response) {
+	ch := make(chan response, 1) // cap of 1 so the resolver doesn't block if the provisioning side goroutine exits prematurely
 
 	x.mux.Lock()
 
@@ -769,9 +837,10 @@ func (x *dispatch) release(id uint64) {
 }
 
 // resolve delivers a response to the appropriate channel.
-func (x *dispatch) resolve(id uint64, resp Decoder) {
+func (x *dispatch) resolve(id uint64, resp response) {
 	x.mux.Lock()
 	ch, ok := x.pending[id]
+	delete(x.pending, id)
 	x.mux.Unlock()
 
 	if ok {
@@ -779,141 +848,59 @@ func (x *dispatch) resolve(id uint64, resp Decoder) {
 	}
 }
 
-type libraryResponder struct {
-	c Codec
-	l Library
+// dualGate is the response variant of DualGate
+type dualGate struct {
+	v *DualGate
 }
 
-func (x libraryResponder) Respond(dec Decoder) (Encoder, error) {
-	// decode procedure name
-	var name string
-	if err := dec.Decode(&name); err != nil {
-		return nil, decodingError{err}
-	}
-
-	// get procedure
-	proc, err := x.l.Get(name)
-	if err != nil {
-		return nil, err
-	}
-
-	// get argument pointers
-	vals := proc.Args()
-	if err = dec.DecodeValues(vals); err != nil {
-		return nil, decodingError{err}
-	}
-
-	// dereference pointers
-	for i := range vals {
-		vals[i] = vals[i].Elem()
-	}
-
-	// make function call
-	vals, err = proc.Call(vals)
-
-	// call error is encoded back as a string
-	var errStr string
-	if err != nil {
-		errStr = err.Error()
-	}
-
-	enc := x.c.Encoder()
-	if err = enc.EncodeValues(vals); err != nil {
-		return nil, err
-	}
-	if err = enc.Encode(errStr); err != nil {
-		return nil, err
-	}
-
-	return enc, nil
+func (x dualGate) ChainDecode(dst DecoderFrom) error {
+	return x.v.ChainDecodeResp(dst)
 }
 
-type processor struct {
-	c Codec
-	r Responder
+func (x dualGate) Encoder() (Encoder, error) {
+	return x.v.EncoderResp()
 }
 
-// MakeProcessor bundles a Codec and a Responder to function as an io.Processor.
-// Serves as basic server side intermediary between raw binary and RPC logic.
-func MakeProcessor(c Codec, r Responder) io.Processor {
-	return processor{
-		c: c,
-		r: r,
-	}
+// used with dispatch type
+type request struct {
+	id     uint64
+	cancel func(uint64)
+
+	enc Encoder
+	ch  chan response
 }
 
-func (x processor) Process(b []byte) ([]byte, error) {
-	dec := x.c.Decoder()
-	if err := dec.Write(b); err != nil {
-		return nil, err
-	}
-
-	enc, err := x.r.Respond(dec)
-	if err != nil {
-		return nil, err
-	}
-
-	return enc.Read()
+func (x request) Cancel() {
+	x.enc.Cancel()
+	x.cancel(x.id)
 }
 
-type requester struct {
-	c Codec
-	p io.Processor
+func (x request) Do() (Decoder, error) {
+	resp := <-x.ch
+	return resp.dec, resp.err
 }
 
-// MakeRequester bundles a Codec and an io.Processor to function as a basic Requester.
-// Suitable for use when the underlying connection is capable of directly returning the response to a specific request message, by itself.
-func MakeRequester(c Codec, p io.Processor) Requester {
-	return requester{
-		c: c,
-		p: p,
-	}
+func (x request) Encode(v reflect.Value) error {
+	return x.enc.Encode(v)
 }
 
-func (x requester) Request(enc Encoder) (Decoder, error) {
-	// get binary encoding
-	b, err := enc.Read()
-	if err != nil {
-		return nil, err
-	}
-
-	// send request and wait for response
-	if b, err = x.p.Process(b); err != nil {
-		return nil, err
-	}
-
-	// wrap and return response
-	dec := x.c.Decoder()
-	if err = dec.Write(b); err != nil {
-		return nil, err
-	}
-
-	return dec, nil
+// used to deliver Request response through channel
+type response struct {
+	dec Decoder
+	err error
 }
 
-// respondId decodes a request ID and encodes it back into a response.
-func respondId(res Responder, dec Decoder) (Encoder, error) {
-	// decode call ID, encode it back unchanged when responding
-	var id uint64
-	if err := dec.Decode(&id); err != nil {
-		// return early if we can't even identify the call
-		return nil, decodingError{err}
+// check is used to recursively check input and output types.
+func check(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Chan, reflect.Interface, reflect.Func:
+		return false
 	}
-
-	enc, err := res.Respond(dec)
-	if err != nil {
-		return nil, err
-	}
-	if err := enc.Encode(id); err != nil {
-		return nil, err
-	}
-
-	return enc, nil
+	return true
 }
 
 // validateFunc checks the given function type.
 // Returns an error if it isn't supported by this package.
-//TODO deep check of input and output types.
 func validateFunc(ft reflect.Type) error {
 	if ft.Kind() != reflect.Func {
 		return errors.New("not a function")
@@ -921,42 +908,23 @@ func validateFunc(ft reflect.Type) error {
 
 	// check inputs
 	for i, n := 0, ft.NumIn(); i < n; i++ {
-		k := ft.In(i).Kind()
-		if _, ok := invalidKinds[k]; ok {
-			return errors.New("unsupported input kind " + k.String())
+		if t := ft.In(i); !conv.Check(t, check) {
+			return errors.New("unsupported input type " + t.String())
 		}
 	}
 
 	// check error
 	numOut := ft.NumOut() - 1
-	if numOut < 0 || ft.Out(numOut) != errorType {
+	if numOut < 0 || ft.Out(numOut) != typeError {
 		return errors.New("function does not return an error")
 	}
 
 	// check rest of outputs
 	for i := 0; i < numOut; i++ {
-		outType := ft.Out(i)
-		k := outType.Kind()
-		if _, ok := invalidKinds[k]; ok {
-			return errors.New("unsupported output kind " + k.String())
+		if t := ft.Out(i); !conv.Check(t, check) {
+			return errors.New("unsupported output type " + t.String())
 		}
 	}
 
 	return nil
-}
-
-// writeNonTo encodes and writes a non-rpc message
-func writeNonTo(b []byte, c Codec, w io.Writer) error {
-	enc := c.Encoder()
-	if err := enc.Encode(b); err != nil {
-		return err
-	}
-	if err := enc.Encode(false); err != nil {
-		return err
-	}
-	r, err := enc.Read()
-	if err != nil {
-		return err
-	}
-	return w.Write(r)
 }
