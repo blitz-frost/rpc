@@ -755,6 +755,7 @@ func (x *dispatch) provision() (uint64, chan Decoder) {
 	// normally there should be a check for pending IDs, but that should really never be necessary
 	id := x.next
 	x.pending[id] = ch
+	x.next++
 
 	x.mux.Unlock()
 

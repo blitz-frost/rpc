@@ -86,7 +86,7 @@ func (x *Signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerF
 
 		mux.Lock()
 		for _, candidate := range pending {
-			go x.candidate(candidate)
+			x.candidate(candidate)
 		}
 		mux.Unlock()
 
@@ -118,7 +118,7 @@ func (x *Signaler) setup(conn *webrtc.PeerConnection, cw io.ChainWriter, answerF
 		if desc == nil {
 			pending = append(pending, candidate)
 		} else {
-			go x.candidate(candidate)
+			x.candidate(candidate)
 		}
 	})
 }
@@ -131,7 +131,7 @@ func SignalAnswer(conn *webrtc.PeerConnection, cw io.ChainWriter) error {
 			return err
 		}
 
-		go sig.fnSdp(answer)
+		sig.fnSdp(answer)
 
 		return conn.SetLocalDescription(answer)
 	}
@@ -157,7 +157,9 @@ func SignalOffer(conn *webrtc.PeerConnection, cw io.ChainWriter) (func() error, 
 			return err
 		}
 
-		return sig.fnSdp(offer)
+		err = sig.fnSdp(offer)
+
+		return err
 	}
 
 	return fn, fn()
