@@ -1,6 +1,9 @@
 /*
 Package rpc provides bridging of function calls between two Go programs.
 
+The main types are [Client] on the call side, and [Library] on the answer side. [Caller] is left as an interface that importers may implement in order to use custom call mechanisms.
+Otherwise, [CallGate] and [AnswerGate] are the two reference types used to bridge between a Client and a Library that reside on different processes/machines.
+
 A good approach when using this package is to write a common "cross" package that defines one or more Interfaces.
 That package would then be important by all involved programs.
 An example such package would look like this:
@@ -23,7 +26,7 @@ An example such package would look like this:
 		},
 	}
 
-The server side would then look something like this:
+The answer side would then look something like this:
 
 	import (
 		"github.com/blitz-frost/rpc"
@@ -42,7 +45,7 @@ The server side would then look something like this:
 		... make lib available ...
 	}
 
-The client side:
+The caller side:
 
 	import (
 		"github.com/blitz-frost/rpc"
@@ -66,11 +69,134 @@ package rpc
 import (
 	"errors"
 	"reflect"
-	"sync"
 
 	"github.com/blitz-frost/conv"
-	"github.com/blitz-frost/io/msg"
+	"github.com/blitz-frost/encoding"
 )
+
+type AnswerGate struct {
+	lib Library
+}
+
+func MakeAnswerGate(lib Library) AnswerGate {
+	return AnswerGate{lib}
+}
+
+func (x AnswerGate) DecodeFrom(dec encoding.ExchangeDecoder) error {
+	// don't return decode errors or missing procedure; silently drop
+	nameVal, err := dec.Decode(typeString)
+	if err != nil {
+		dec.Close()
+		return nil
+	}
+
+	proc, err := x.lib.Get(nameVal.String())
+	if err != nil {
+		dec.Close()
+		return nil
+	}
+
+	argTypes := proc.Args()
+	argValues := make([]reflect.Value, len(argTypes))
+	for i, t := range argTypes {
+		if argValues[i], err = dec.Decode(t); err != nil {
+			dec.Close()
+			return nil
+		}
+	}
+	dec.Close()
+
+	results, errCall := proc.Call(argValues)
+
+	enc, err := dec.Encoder()
+	if err != nil {
+		return err
+	}
+
+	var errStr string
+	if errCall != nil {
+		errStr = errCall.Error()
+	}
+
+	if err := enc.Encode(reflect.ValueOf(errStr)); err != nil {
+		return enc.Close()
+	}
+
+	// don't bother encoding the output if we have an error
+	if errCall != nil {
+		return enc.Close()
+	}
+
+	for _, v := range results {
+		if err := enc.Encode(v); err != nil {
+			return enc.Close()
+		}
+	}
+
+	return enc.Close()
+}
+
+type CallGate struct {
+	eeg encoding.ExchangeEncoderGiver
+}
+
+func MakeCallGate(eeg encoding.ExchangeEncoderGiver) CallGate {
+	return CallGate{eeg}
+}
+
+func (x CallGate) Call(name string, args []reflect.Value, outTypes []reflect.Type) (result []reflect.Value, err error) {
+	nOut := len(outTypes)
+	result = make([]reflect.Value, nOut, nOut+1) // provide capacity for error value appending
+	defer func() {
+		if err != nil {
+			for i := range result {
+				result[i] = reflect.Zero(outTypes[i])
+			}
+		}
+	}()
+
+	enc, err := x.eeg.Encoder()
+	if err != nil {
+		return
+	}
+
+	if err = enc.Encode(reflect.ValueOf(name)); err != nil {
+		enc.Close()
+		return
+	}
+	for i := range args {
+		if err = enc.Encode(args[i]); err != nil {
+			enc.Close()
+			return
+		}
+	}
+
+	// send call and get response
+	dec, err := enc.Decoder()
+	if err != nil {
+		return
+	}
+	defer dec.Close()
+
+	// check error
+	errVal, err := dec.Decode(typeString)
+	if err != nil {
+		return
+	}
+	if errStr := errVal.String(); errStr != "" {
+		err = errors.New(errStr)
+		return
+	}
+
+	// decode results
+	for i := range result {
+		if result[i], err = dec.Decode(outTypes[i]); err != nil {
+			return
+		}
+	}
+
+	return
+}
 
 // A Caller mediates procedure calls between a Client and a Library, without having to hold information about either end.
 type Caller interface {
@@ -159,199 +285,6 @@ func (x Client) BindClass(classPtr any) error {
 	}
 
 	return nil
-}
-
-// A Codec provides matching Encoders and Decoders, on demand.
-// These can be used to sequantially encode or decode data.
-type Codec interface {
-	Decoder(msg.Reader) Decoder
-	Encoder(msg.Writer) Encoder
-}
-
-type CodecConn interface {
-	Encoder() (Encoder, error)
-	ChainDecode(DecoderFrom) error
-}
-
-type Conn interface {
-	msg.WriterSource
-	msg.ReadChainer
-}
-
-type Decoder interface {
-	Reader() (msg.Reader, error) // expose raw byte reader, at current position; Decoder should no longer be used
-	Decode(reflect.Type) (reflect.Value, error)
-	Close() error
-}
-
-type DecoderFrom interface {
-	DecodeFrom(Decoder) error
-}
-
-// A DualGate filters between RPC requests and responses.
-// If one side of the connection uses a DualGate, then both sides must do so.
-type DualGate struct {
-	conn CodecConn
-
-	dstReq DecoderFrom
-	dstRes DecoderFrom
-}
-
-func NewDualGate(conn CodecConn) *DualGate {
-	x := &DualGate{
-		conn: conn,
-	}
-	conn.ChainDecode(x)
-	return x
-}
-
-// AsConnResp returns the DualGate as a CodecConn for use by ResponseGates.
-func (x *DualGate) AsConnResp() CodecConn {
-	return dualGate{x}
-}
-
-func (x *DualGate) ChainDecode(dstReq DecoderFrom) error {
-	x.dstReq = dstReq
-	return nil
-}
-
-func (x *DualGate) ChainDecodeResp(dstRes DecoderFrom) error {
-	x.dstRes = dstRes
-	return nil
-}
-
-func (x *DualGate) DecodeFrom(dec Decoder) error {
-	isReqVal, err := dec.Decode(typeBool)
-	if err != nil {
-		dec.Close()
-		return nil
-	}
-
-	if isReqVal.Bool() {
-		return x.dstReq.DecodeFrom(dec)
-	}
-
-	return x.dstRes.DecodeFrom(dec)
-}
-
-func (x *DualGate) Encoder() (Encoder, error) {
-	enc, err := x.conn.Encoder()
-	if err != nil {
-		return nil, err
-	}
-
-	// is request
-	if err = enc.Encode(reflect.ValueOf(true)); err != nil {
-		enc.Cancel()
-		return nil, err
-	}
-
-	return enc, nil
-}
-
-func (x *DualGate) EncoderResp() (Encoder, error) {
-	enc, err := x.conn.Encoder()
-	if err != nil {
-		return nil, err
-	}
-
-	// is not request
-	if err = enc.Encode(reflect.ValueOf(false)); err != nil {
-		enc.Cancel()
-		return nil, err
-	}
-
-	return enc, nil
-}
-
-type Encoder interface {
-	Writer() (msg.Writer, error) // expose raw byte writer; Encoder should finalize and it should not be used anymore
-	Encode(reflect.Value) error
-	Close() error
-	Cancel()
-}
-
-// A Gate filters RPC from non-RPC messages.
-// To be used when the underlying connection is not used exclusively for RPC data transfer.
-// If one side uses a Gate, them both sides must do so.
-//
-// Users should use the Gate.Writer method to write to the underlying connection.
-type Gate struct {
-	conn CodecConn
-
-	dstRpc DecoderFrom
-	dstNon msg.ReaderFrom
-}
-
-// Wraps conn as a Gate. Both RPC and non-RPC destinations must be set before usage.
-func NewGate(conn CodecConn) *Gate {
-	x := &Gate{
-		conn: conn,
-	}
-	conn.ChainDecode(x)
-	return x
-}
-
-// set RPC message destination
-func (x *Gate) ChainDecode(dst DecoderFrom) error {
-	x.dstRpc = dst
-	return nil
-}
-
-// set non-RPC message destination
-func (x *Gate) ChainRead(dst msg.ReaderFrom) error {
-	x.dstNon = dst
-	return nil
-}
-
-func (x *Gate) DecodeFrom(dec Decoder) error {
-	// is RPC?
-	isRpcVal, err := dec.Decode(typeBool)
-	if err != nil {
-		// silently drop unexpected messages
-		dec.Close()
-		return nil
-	}
-
-	if isRpcVal.Bool() {
-		return x.dstRpc.DecodeFrom(dec)
-	}
-
-	r, err := dec.Reader()
-	if err != nil {
-		dec.Close()
-		return err
-	}
-	return x.dstNon.ReadFrom(r)
-}
-
-func (x *Gate) Encoder() (Encoder, error) {
-	enc, err := x.conn.Encoder()
-	if err != nil {
-		return nil, err
-	}
-
-	// is an RPC message
-	if err = enc.Encode(reflect.ValueOf(true)); err != nil {
-		return nil, err
-	}
-
-	return enc, err
-}
-
-// Writer returns a writer for non-RPC data. To be used instead of requesting one from the underling connection directly.
-func (x *Gate) Writer() (msg.Writer, error) {
-	enc, err := x.conn.Encoder()
-	if err != nil {
-		return nil, err
-	}
-
-	// is not an RPC message
-	if err = enc.Encode(reflect.ValueOf(false)); err != nil {
-		return nil, err
-	}
-
-	return enc.Writer()
 }
 
 // An Interface helps maintain consistency between Go programs.
@@ -464,6 +397,8 @@ func (x Library) RegisterClass(class any) error {
 
 // A Procedure wraps functions to be usable by this package.
 // Underlying function must have a final error output. All its other return values and arguments must be concrete types.
+//
+// Importers don't generally need to use this type directly, but it is exported for custom call mechanism implementations.
 type Procedure struct {
 	f      reflect.Value  // underlying function
 	inType []reflect.Type // input types
@@ -511,280 +446,10 @@ func (x Procedure) Call(in []reflect.Value) ([]reflect.Value, error) {
 	return r[:n], nil
 }
 
-type Request interface {
-	Encode(reflect.Value) error
-	Do() (Decoder, error)
-	Cancel()
-}
-
-type RequestGate struct {
-	conn CodecConn
-
-	disp dispatch // request identification
-}
-
-func NewRequestGate(conn CodecConn) *RequestGate {
-	x := &RequestGate{
-		conn: conn,
-		disp: *newDispatch(),
-	}
-	conn.ChainDecode(x)
-	return x
-}
-
-// DecodeFrom accepts incoming encoded messages from a connection.
-func (x *RequestGate) DecodeFrom(dec Decoder) error {
-	// don't return errors related to decoding a particular message
-
-	// decode call ID
-	idVal, err := dec.Decode(typeUint64)
-	if err != nil {
-		dec.Close()
-		return nil
-	}
-
-	x.disp.resolve(idVal.Uint(), response{
-		dec: dec,
-		err: nil,
-	})
-	return nil
-}
-
-func (x *RequestGate) Request() (Request, error) {
-	// allocate call ID and associated response channel
-	// do this before potentially blocking the connection for encoding
-	id, ch := x.disp.provision()
-
-	enc, err := x.conn.Encoder()
-	if err != nil {
-		x.disp.release(id)
-		return nil, err
-	}
-
-	req := request{
-		id:     id,
-		cancel: x.disp.release,
-		enc:    enc,
-		ch:     ch,
-	}
-
-	// encode ID
-	if err := enc.Encode(reflect.ValueOf(id)); err != nil {
-		req.Cancel()
-		return nil, err
-	}
-
-	return req, nil
-}
-
-type Requester interface {
-	Request() (Request, error)
-}
-
-type ResponseGate struct {
-	conn CodecConn
-	lib  Library
-}
-
-func MakeResponseGate(conn CodecConn, lib Library) ResponseGate {
-	x := ResponseGate{
-		conn: conn,
-		lib:  lib,
-	}
-	conn.ChainDecode(x)
-	return x
-}
-
-func (x ResponseGate) DecodeFrom(dec Decoder) (err error) {
-	idVal, errDec := dec.Decode(typeUint64)
-	defer func() {
-		if errDec != nil {
-			dec.Close()
-		}
-	}()
-	if errDec != nil {
-		return nil
-	}
-
-	nameVal, errDec := dec.Decode(typeString)
-	if errDec != nil {
-		return nil
-	}
-
-	var (
-		results []reflect.Value
-		errCall error
-	)
-	defer func() {
-		// send no response if input could not be decoded
-		if errDec != nil {
-			return
-		}
-
-		var enc Encoder
-		enc, err = x.conn.Encoder()
-		if err != nil {
-			return
-		}
-
-		defer func() {
-			if err != nil {
-				enc.Cancel()
-			} else {
-				enc.Close()
-			}
-		}()
-
-		if err = enc.Encode(idVal); err != nil {
-			return
-		}
-
-		var errStr string
-		if errCall != nil {
-			errStr = errCall.Error()
-		}
-
-		if err = enc.Encode(reflect.ValueOf(errStr)); err != nil {
-			return
-		}
-
-		// don't bother encoding the output if we have an error
-		if errCall != nil {
-			return
-		}
-
-		for _, v := range results {
-			if err = enc.Encode(v); err != nil {
-				return
-			}
-		}
-	}()
-
-	proc, errCall := x.lib.Get(nameVal.String())
-	if errCall != nil {
-		dec.Close()
-		return nil
-	}
-
-	argTypes := proc.Args()
-	argValues := make([]reflect.Value, len(argTypes))
-	for i, t := range argTypes {
-		if argValues[i], errDec = dec.Decode(t); err != nil {
-			return nil
-		}
-	}
-	dec.Close()
-
-	results, errCall = proc.Call(argValues)
-
-	return
-}
-
 var (
-	typeBool   = reflect.TypeOf(true)
 	typeError  = reflect.TypeOf(new(error)).Elem()
 	typeString = reflect.TypeOf("")
-	typeUint64 = reflect.TypeOf(uint64(0))
 )
-
-type caller struct {
-	r Requester
-}
-
-// MakeCaller wraps a Requester to function as a Caller.
-func MakeCaller(r Requester) Caller {
-	return caller{
-		r: r,
-	}
-}
-
-func (x caller) Call(name string, args []reflect.Value, outTypes []reflect.Type) (result []reflect.Value, err error) {
-	nOut := len(outTypes)
-	result = make([]reflect.Value, nOut, nOut+1) // provide capacity for error value appending
-	defer func() {
-		if err != nil {
-			for i := range result {
-				result[i] = reflect.Zero(outTypes[i])
-			}
-		}
-	}()
-
-	req, err := x.r.Request()
-	if err != nil {
-		return
-	}
-
-	if err = req.Encode(reflect.ValueOf(name)); err != nil {
-		req.Cancel()
-		return
-	}
-	for i := range args {
-		if err = req.Encode(args[i]); err != nil {
-			req.Cancel()
-			return
-		}
-	}
-
-	// send call and get response
-	dec, err := req.Do()
-	if err != nil {
-		return
-	}
-	defer dec.Close()
-
-	// check error
-	errVal, err := dec.Decode(typeString)
-	if err != nil {
-		return
-	}
-	if errStr := errVal.String(); errStr != "" {
-		err = errors.New(errStr)
-		return
-	}
-
-	// decode results
-	for i := range result {
-		if result[i], err = dec.Decode(outTypes[i]); err != nil {
-			return
-		}
-	}
-
-	return
-}
-
-type codecConn struct {
-	conn  Conn
-	codec Codec
-
-	dst DecoderFrom
-}
-
-func WrapConn(conn Conn, codec Codec) CodecConn {
-	x := &codecConn{
-		conn:  conn,
-		codec: codec,
-	}
-	conn.ChainRead(x)
-	return x
-}
-
-func (x *codecConn) ChainDecode(dst DecoderFrom) error {
-	x.dst = dst
-	return nil
-}
-
-func (x codecConn) Encoder() (Encoder, error) {
-	w, err := x.conn.Writer()
-	if err != nil {
-		return nil, err
-	}
-	return x.codec.Encoder(w), nil
-}
-
-func (x codecConn) ReadFrom(r msg.Reader) error {
-	dec := x.codec.Decoder(r)
-	return x.dst.DecodeFrom(dec)
-}
 
 // decodingError wraps decoding errors.
 // Read loops should generally not crash because of malformed messages.
@@ -799,95 +464,6 @@ func (x decodingError) Error() string {
 
 func (x decodingError) Unwrap() error {
 	return x.err
-}
-
-type dispatch struct {
-	next    uint64
-	pending map[uint64]chan response
-	mux     sync.Mutex
-}
-
-func newDispatch() *dispatch {
-	return &dispatch{
-		pending: make(map[uint64]chan response),
-	}
-}
-
-// provision returns a unique ID and a channel to receive an asynchronous response.
-// It is the caller's responsibility to resolve or release the provided ID.
-func (x *dispatch) provision() (uint64, chan response) {
-	ch := make(chan response, 1) // cap of 1 so the resolver doesn't block if the provisioning side goroutine exits prematurely
-
-	x.mux.Lock()
-
-	// normally there should be a check for pending IDs, but that should really never be necessary
-	id := x.next
-	x.pending[id] = ch
-
-	x.mux.Unlock()
-
-	return id, ch
-}
-
-// release cleans up the specified ID.
-func (x *dispatch) release(id uint64) {
-	x.mux.Lock()
-	delete(x.pending, id)
-	x.mux.Unlock()
-}
-
-// resolve delivers a response to the appropriate channel.
-func (x *dispatch) resolve(id uint64, resp response) {
-	x.mux.Lock()
-	ch, ok := x.pending[id]
-	delete(x.pending, id)
-	x.mux.Unlock()
-
-	if ok {
-		ch <- resp
-	}
-}
-
-// dualGate is the response variant of DualGate
-type dualGate struct {
-	v *DualGate
-}
-
-func (x dualGate) ChainDecode(dst DecoderFrom) error {
-	return x.v.ChainDecodeResp(dst)
-}
-
-func (x dualGate) Encoder() (Encoder, error) {
-	return x.v.EncoderResp()
-}
-
-// used with dispatch type
-type request struct {
-	id     uint64
-	cancel func(uint64)
-
-	enc Encoder
-	ch  chan response
-}
-
-func (x request) Cancel() {
-	x.enc.Cancel()
-	x.cancel(x.id)
-}
-
-func (x request) Do() (Decoder, error) {
-	resp := <-x.ch
-	return resp.dec, resp.err
-}
-
-func (x request) Encode(v reflect.Value) error {
-	return x.enc.Encode(v)
-}
-
-// used to deliver Request response through channel
-type response struct {
-	dec Decoder
-	err error
 }
 
 // check is used to recursively check input and output types.

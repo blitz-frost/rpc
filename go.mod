@@ -1,12 +1,13 @@
 module github.com/blitz-frost/rpc
 
-go 1.18
+go 1.19
 
 require (
 	github.com/blitz-frost/conv v0.3.0
+	github.com/blitz-frost/encoding v0.0.0
 	github.com/blitz-frost/ice v0.1.2
 	github.com/blitz-frost/io v0.1.2
-	github.com/blitz-frost/wasm v0.2.3
+	github.com/blitz-frost/wasm v0.2.4
 	github.com/gorilla/websocket v1.5.0
 	github.com/pion/webrtc/v3 v3.1.27
 )
@@ -35,6 +36,10 @@ require (
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 )
 
+replace github.com/blitz-frost/encoding => /home/blitzfrost/go/src/github.com/blitz-frost/encoding
+
 replace github.com/blitz-frost/ice => /home/blitzfrost/go/src/github.com/blitz-frost/ice
 
 replace github.com/blitz-frost/io => /home/blitzfrost/go/src/github.com/blitz-frost/io
+
+replace github.com/blitz-frost/conv => /home/blitzfrost/go/src/github.com/blitz-frost/conv
