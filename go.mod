@@ -1,6 +1,6 @@
 module github.com/blitz-frost/rpc
 
-go 1.18
+go 1.19
 
 require (
 	github.com/blitz-frost/ice v0.1.2
