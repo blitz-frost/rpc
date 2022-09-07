@@ -71,44 +71,45 @@ import (
 	"reflect"
 
 	"github.com/blitz-frost/conv"
-	"github.com/blitz-frost/encoding"
+	"github.com/blitz-frost/encoding/msg"
 )
 
 type AnswerGate struct {
 	lib Library
 }
 
+// Note that if the [Library] includes recursive remote calls, then the underlying connection setup must be capable of supporting concurrent reading; i.e. must not block on a single AnswerGate.ReaderTake call.
 func MakeAnswerGate(lib Library) AnswerGate {
 	return AnswerGate{lib}
 }
 
-func (x AnswerGate) DecodeFrom(dec encoding.ExchangeDecoder) error {
+func (x AnswerGate) ReaderTake(r msg.ExchangeReader) error {
 	// don't return decode errors or missing procedure; silently drop
-	nameVal, err := dec.Decode(typeString)
+	nameVal, err := r.Decode(typeString)
 	if err != nil {
-		dec.Close()
+		r.Close()
 		return nil
 	}
 
 	proc, err := x.lib.Get(nameVal.String())
 	if err != nil {
-		dec.Close()
+		r.Close()
 		return nil
 	}
 
 	argTypes := proc.Args()
 	argValues := make([]reflect.Value, len(argTypes))
 	for i, t := range argTypes {
-		if argValues[i], err = dec.Decode(t); err != nil {
-			dec.Close()
+		if argValues[i], err = r.Decode(t); err != nil {
+			r.Close()
 			return nil
 		}
 	}
-	dec.Close()
+	r.Close()
 
 	results, errCall := proc.Call(argValues)
 
-	enc, err := dec.Encoder()
+	w, err := r.Writer()
 	if err != nil {
 		return err
 	}
@@ -118,30 +119,30 @@ func (x AnswerGate) DecodeFrom(dec encoding.ExchangeDecoder) error {
 		errStr = errCall.Error()
 	}
 
-	if err := enc.Encode(reflect.ValueOf(errStr)); err != nil {
-		return enc.Close()
+	if err := w.Encode(reflect.ValueOf(errStr)); err != nil {
+		return w.Close()
 	}
 
 	// don't bother encoding the output if we have an error
 	if errCall != nil {
-		return enc.Close()
+		return w.Close()
 	}
 
 	for _, v := range results {
-		if err := enc.Encode(v); err != nil {
-			return enc.Close()
+		if err := w.Encode(v); err != nil {
+			return w.Close()
 		}
 	}
 
-	return enc.Close()
+	return w.Close()
 }
 
 type CallGate struct {
-	eeg encoding.ExchangeEncoderGiver
+	ewg msg.ExchangeWriterGiver
 }
 
-func MakeCallGate(eeg encoding.ExchangeEncoderGiver) CallGate {
-	return CallGate{eeg}
+func MakeCallGate(ewg msg.ExchangeWriterGiver) CallGate {
+	return CallGate{ewg}
 }
 
 func (x CallGate) Call(name string, args []reflect.Value, outTypes []reflect.Type) (result []reflect.Value, err error) {
@@ -155,31 +156,31 @@ func (x CallGate) Call(name string, args []reflect.Value, outTypes []reflect.Typ
 		}
 	}()
 
-	enc, err := x.eeg.Encoder()
+	w, err := x.ewg.Writer()
 	if err != nil {
 		return
 	}
 
-	if err = enc.Encode(reflect.ValueOf(name)); err != nil {
-		enc.Close()
+	if err = w.Encode(reflect.ValueOf(name)); err != nil {
+		w.Close()
 		return
 	}
 	for i := range args {
-		if err = enc.Encode(args[i]); err != nil {
-			enc.Close()
+		if err = w.Encode(args[i]); err != nil {
+			w.Close()
 			return
 		}
 	}
 
 	// send call and get response
-	dec, err := enc.Decoder()
+	r, err := w.Reader()
 	if err != nil {
 		return
 	}
-	defer dec.Close()
+	defer r.Close()
 
 	// check error
-	errVal, err := dec.Decode(typeString)
+	errVal, err := r.Decode(typeString)
 	if err != nil {
 		return
 	}
@@ -190,7 +191,7 @@ func (x CallGate) Call(name string, args []reflect.Value, outTypes []reflect.Typ
 
 	// decode results
 	for i := range result {
-		if result[i], err = dec.Decode(outTypes[i]); err != nil {
+		if result[i], err = r.Decode(outTypes[i]); err != nil {
 			return
 		}
 	}
@@ -217,6 +218,7 @@ type Client struct {
 	c Caller
 }
 
+// Note that function pointers bound to the resulting Client are concurrent safe only if the used Caller is concurrent safe.
 func MakeClient(c Caller) Client {
 	return Client{c}
 }
@@ -356,7 +358,8 @@ func (x Library) Register(name string, f any) error {
 	return nil
 }
 
-/* RegisterClass registers all the functions of a class, using their member names.
+/*
+	RegisterClass registers all the functions of a class, using their member names.
 
 A class is an informal struct type containing only exported function members. Example:
 
