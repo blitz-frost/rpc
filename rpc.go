@@ -472,7 +472,7 @@ func (x decodingError) Unwrap() error {
 // check is used to recursively check input and output types.
 func check(t reflect.Type) bool {
 	switch t.Kind() {
-	case reflect.Chan, reflect.Interface, reflect.Func:
+	case reflect.Chan, reflect.Func:
 		return false
 	}
 	return true
