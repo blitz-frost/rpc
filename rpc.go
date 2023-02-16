@@ -40,7 +40,7 @@ The answer side would then look something like this:
 			...
 		}
 
-		lib := rpc.MakeLibrary()
+		lib := rpc.LibraryMake()
 		cross.AnInterface.RegisterWith(lib)
 		... make lib available ...
 	}
@@ -71,19 +71,21 @@ import (
 	"reflect"
 
 	"github.com/blitz-frost/conv"
-	"github.com/blitz-frost/encoding/msg"
+	"github.com/blitz-frost/encoding"
+	msgenc "github.com/blitz-frost/encoding/msg"
+	msgio "github.com/blitz-frost/io/msg"
+	"github.com/blitz-frost/msg"
 )
 
 type AnswerGate struct {
 	lib Library
 }
 
-// Note that if the [Library] includes recursive remote calls, then the underlying connection setup must be capable of supporting concurrent reading; i.e. must not block on a single AnswerGate.ReaderTake call.
-func MakeAnswerGate(lib Library) AnswerGate {
+func AnswerGateMake(lib Library) AnswerGate {
 	return AnswerGate{lib}
 }
 
-func (x AnswerGate) ReaderTake(r msg.ExchangeReader) error {
+func (x AnswerGate) ReaderTake(r msgenc.ExchangeReader) error {
 	// don't return decode errors or missing procedure; silently drop
 	nameVal, err := r.Decode(typeString)
 	if err != nil {
@@ -138,10 +140,10 @@ func (x AnswerGate) ReaderTake(r msg.ExchangeReader) error {
 }
 
 type CallGate struct {
-	ewg msg.ExchangeWriterGiver
+	ewg msgenc.ExchangeWriterGiver
 }
 
-func MakeCallGate(ewg msg.ExchangeWriterGiver) CallGate {
+func CallGateMake(ewg msgenc.ExchangeWriterGiver) CallGate {
 	return CallGate{ewg}
 }
 
@@ -219,7 +221,7 @@ type Client struct {
 }
 
 // Note that function pointers bound to the resulting Client are concurrent safe only if the used Caller is concurrent safe.
-func MakeClient(c Caller) Client {
+func ClientMake(c Caller) Client {
 	return Client{c}
 }
 
@@ -256,10 +258,10 @@ func (x Client) Bind(name string, fptr any) error {
 	return nil
 }
 
-// BindClass binds all the functions in a class pointer.
-// See Library.RegisterClass for an explanation on classes.
-func (x Client) BindClass(classPtr any) error {
-	v := reflect.ValueOf(classPtr)
+// BindSet binds all the functions in a set pointer.
+// See Library.RegisterSet for an explanation on sets.
+func (x Client) BindSet(setPtr any) error {
+	v := reflect.ValueOf(setPtr)
 	if v.Kind() != reflect.Pointer {
 		return errors.New("not a pointer")
 	}
@@ -333,7 +335,7 @@ type Library struct {
 	lib map[string]Procedure
 }
 
-func MakeLibrary() Library {
+func LibraryMake() Library {
 	return Library{
 		lib: make(map[string]Procedure),
 	}
@@ -349,7 +351,7 @@ func (x Library) Get(name string) (Procedure, error) {
 }
 
 func (x Library) Register(name string, f any) error {
-	p, err := makeProcedure(f)
+	p, err := procedureMake(f)
 	if err != nil {
 		return err
 	}
@@ -359,20 +361,20 @@ func (x Library) Register(name string, f any) error {
 }
 
 /*
-	RegisterClass registers all the functions of a class, using their member names.
+	RegisterSet registers all the functions of a set, using their member names.
 
-A class is an informal struct type containing only exported function members. Example:
+A set is an informal struct type containing only exported function members. Example:
 
-	type SomeClass struct {
+	type SomeSet struct {
 		SomeFunc func()
 		OtherFunc func(int) error
 	}
 
-The primary purpose of classes is to define method set contracts in cross packages.
+The primary purpose of sets is to define method set contracts in cross packages.
 The Interface type should be more convenient for global function contracts, but the two approaches are essentially interchangable.
 */
-func (x Library) RegisterClass(class any) error {
-	v := reflect.ValueOf(class)
+func (x Library) RegisterSet(set any) error {
+	v := reflect.ValueOf(set)
 	t := v.Type()
 
 	if t.Kind() != reflect.Struct {
@@ -407,8 +409,8 @@ type Procedure struct {
 	inType []reflect.Type // input types
 }
 
-// makeProcedure fails if f has non-concrete inputs or outputs, excluding a final error output.
-func makeProcedure(f any) (Procedure, error) {
+// procedureMake fails if f has non-concrete inputs or outputs, excluding a final error output.
+func procedureMake(f any) (Procedure, error) {
 	t := reflect.TypeOf(f)
 
 	if err := validateFunc(t); err != nil {
@@ -467,6 +469,57 @@ func (x decodingError) Error() string {
 
 func (x decodingError) Unwrap() error {
 	return x.err
+}
+
+// SetupFull is an utility function to quickly create a full RPC system on top of a basic (or opaque) connection.
+// The system can handle concurrent as well as recursive calls.
+//
+// Peers must take opposite sides.
+func SetupFull(conn msgio.Conn, codec encoding.Codec, side bool) (Client, Library, error) {
+	// ensure concurrency
+	rc, err := msgio.ReaderChainerAsyncNew(conn)
+	if err != nil {
+		return Client{}, Library{}, err
+	}
+	wg := msgio.WriterGiverMutexNew(conn)
+	block := msg.ConnBlock[msgio.Reader, msgio.Writer]{rc, wg}
+
+	// form ExchangeConn
+	mc, err := msgio.MultiplexConnOf(block)
+	if err != nil {
+		return Client{}, Library{}, err
+	}
+
+	var (
+		rCh byte = 0
+		wCh byte = 1
+	)
+	if side {
+		rCh = 1
+		wCh = 0
+	}
+	rConn := msgio.ConnOf(mc, rCh)
+	wConn := msgio.ConnOf(mc, wCh)
+
+	ec, err := msgio.ExchangeConnOf(rConn, wConn)
+	if err != nil {
+		return Client{}, Library{}, err
+	}
+	ecEnc, err := msgenc.ExchangeConnOf(ec, codec)
+	if err != nil {
+		return Client{}, Library{}, err
+	}
+
+	lib := LibraryMake()
+	answerGate := AnswerGateMake(lib)
+	if err := ecEnc.ReaderChain(answerGate); err != nil {
+		return Client{}, Library{}, err
+	}
+
+	callGate := CallGateMake(ecEnc)
+	cli := ClientMake(callGate)
+
+	return cli, lib, nil
 }
 
 // check is used to recursively check input and output types.
