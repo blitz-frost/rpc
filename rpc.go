@@ -74,7 +74,6 @@ import (
 	"github.com/blitz-frost/encoding"
 	msgenc "github.com/blitz-frost/encoding/msg"
 	msgio "github.com/blitz-frost/io/msg"
-	"github.com/blitz-frost/msg"
 )
 
 type AnswerGate struct {
@@ -472,20 +471,12 @@ func (x decodingError) Unwrap() error {
 }
 
 // SetupFull is an utility function to quickly create a full RPC system on top of a basic (or opaque) connection.
-// The system can handle concurrent as well as recursive calls.
+// The system can handle concurrent as well as recursive calls only if the used connection is async capable.
 //
 // Peers must take opposite sides.
 func SetupFull(conn msgio.Conn, codec encoding.Codec, side bool) (Client, Library, error) {
-	// ensure concurrency
-	rc, err := msgio.ReaderChainerAsyncNew(conn)
-	if err != nil {
-		return Client{}, Library{}, err
-	}
-	wg := msgio.WriterGiverMutexNew(conn)
-	block := msg.ConnBlock[msgio.Reader, msgio.Writer]{rc, wg}
-
 	// form ExchangeConn
-	mc, err := msgio.MultiplexConnOf(block)
+	mc, err := msgio.MultiplexConnOf(conn)
 	if err != nil {
 		return Client{}, Library{}, err
 	}
